@@ -338,6 +338,9 @@ static __inline void ring_put_read_page( Ring* aRing, RingPage* anElem )
     * Signal producer no later than half of a ring was processed.
     * It is possible to do it erlier but in case of fast producer
     * the core will be flooded with syscalls
+    *
+    * As consumer always returns page to the queue it is possible
+    * to optimize signaling by eleminating DCAS operation.
     * */
    if( __sync_add_and_fetch( &aRing->_prod_q_size, 1 ) > ( RING_PAGE_COUNT / 2 ) )
    {
