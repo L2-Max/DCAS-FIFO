@@ -26,63 +26,121 @@
 #include <poll.h>
 #include <errno.h>
 
-#define RING_ELEMENT_COUNT       ( 1024 * 4 )
-#define RING_PAYLOAD_SIZE        2048
+/* After my latest tests I found that: page count as bigger as better for slow path,
+ * whereas more elem count is better for fast path. E.g: in case producer is faster than consumer,
+ * it is better to have more elements in the page as the recent accessed page is cached thus not interfere with
+ * lock-free queue. On the other hand, slow or bouncing consumer would miss a packet if page queue is short.
+ *
+ * These numbers were predefined for fast producer and slow consumer.
+ */
 
+#define RING_PAGE_COUNT          ( 1024 * 8 )
+#define RING_ELEM_COUNT          ( 8 )
+
+#define RING_PAYLOAD_SIZE        1600
+
+/*
+ * It is mandatory to have atleast RingPtr to be 8 bytes aligned
+ * in structure
+ * */
 #pragma pack( push, 8 )
 
 typedef struct RingPtr
 {
-   struct RingElem* _ptr;
+   struct RingPage* _ptr;
    unsigned int _counter;
 }
 RingPtr;
 
 typedef struct RingElem
 {
-   struct RingPtr volatile _next;
-
-   uint8_t _payload[ 16 ][ RING_PAYLOAD_SIZE ];
-   uint16_t _len[ 16 ];
-
-   uint16_t _count;
-
-   int _num;
+   uint8_t _payload[ RING_PAYLOAD_SIZE ];
+   uint16_t _len;
 }
 RingElem;
 
+typedef struct RingData
+{
+   RingElem _elem[ RING_ELEM_COUNT ];
+   uint16_t _count;
+}
+RingData;
+
+typedef struct RingPage
+{
+   struct RingPtr volatile _next;
+
+   RingData _prod_data;
+   RingData* _cons_data;
+
+   /*
+    * For debuging purposes
+    * */
+   int _num;
+}
+RingPage;
+
+/*
+ * Must be 8 bytes aligned in structure
+ * */
 typedef struct RingList
 {
-   struct RingPtr volatile _head;
-   struct RingPtr volatile _tail;
-
-   pthread_spinlock_t _lock;
+   __attribute__(( aligned( 8 ) )) struct RingPtr volatile _head;
+   __attribute__(( aligned( 8 ) )) struct RingPtr volatile _tail;
 }
 RingList;
 
-#pragma pack( pop )
-
 typedef struct Ring
 {
-   pthread_mutex_t _mutex;
-   pthread_cond_t _cond;
+   /*
+    * Signaling. Not necessary if consumer/producer are
+    * running on dedicated core. Hovewer, signalling allows
+    * to analyze core utilization
+    * */
+   pthread_mutex_t _prod_mutex;
+   pthread_cond_t _prod_cond;
 
-   uint8_t _wanted;
+   pthread_mutex_t _cons_mutex;
+   pthread_cond_t _cons_cond;
 
-   RingList _reader;
-   RingList _writer;
+   int _prod_wanted;
+   int _cons_wanted;
 
-   uint32_t _aba_counter;
+   int _prod_q_size;
+   int _cons_q_size;
+
+   /*
+    * Must be 8 bytes aligned for fast DCAS operation. Missalignmet
+    * causes -30% of performance
+    * */
+   __attribute__(( aligned( 8 ) )) RingList _reader;
+   __attribute__(( aligned( 8 ) )) RingList _writer;
+
+   /*
+    * Cached page. produced uses it to try to fill all elements
+    * without page get/put operation. Consumer may take the cahe
+    * in case if main consumer's queue is empty. Produced puts
+    * the cache if the page is full or "wanted" flag is set by consumer
+    * */
+   __attribute__(( aligned( 4 ) )) RingPage* volatile _cache;
 }
 Ring;
 
-Ring g_RingRx;
-Ring g_RingTx;
+#pragma pack( pop )
+
+/*
+ * Compiler usually 4 byte aligns. Added as prevention
+ * */
+static __attribute__(( aligned( 8 ) )) Ring g_RingRx;
+static __attribute__(( aligned( 8 ) )) Ring g_RingTx;
 
 static pthread_t g_RxThreadId;
 static pthread_t g_ProcThreadId;
 static pthread_t g_TxThreadId;
 
+/*
+ * Stats for debugging purposes
+ * */
 static int g_RxCount = 0;
 static int g_TxCount = 0;
 static int g_ProcCount = 0;
@@ -96,20 +154,32 @@ static int g_TxGetFailCount = 0;
 static int g_ProcGetFailCount = 0;
 static int g_RxGetFailCount = 0;
 
+static int g_SigPrCount = 0;
+static int g_SigCsCount = 0;
+
 static int g_PrintGuard = 0;
 
-static void ring_debug_print();
+void ring_debug_print();
 
-static RingElem* ring_get_elem( Ring* aRing, RingList* aQueue )
+/*
+ * Dequeues page from FIFO
+ * */
+static __inline RingPage* ring_get_page( Ring* aRing, RingList* aQueue )
 {
+   /*
+    * Soft memory bariers for DCAS
+    * */
    __asm__ __volatile__ ( "" : : : "memory" );
    __sync_synchronize();
 
-   RingPtr theHead;
-   RingPtr theTail;
-   RingPtr theNext;
+   /*
+    * Usually compiler aligned. Prevention.
+    * */
+   __attribute__(( aligned( 8 ) )) RingPtr theHead;
+   __attribute__(( aligned( 8 ) )) RingPtr theTail;
+   __attribute__(( aligned( 8 ) )) RingPtr theNext;
 
-   RingPtr ret;
+   __attribute__(( aligned( 8 ) )) RingPtr ret;
 
    while( 1 )
    {
@@ -117,8 +187,11 @@ static RingElem* ring_get_elem( Ring* aRing, RingList* aQueue )
       theTail = aQueue->_tail;
       theNext = theHead._ptr->_next;
 
-      if( theHead._ptr == aQueue->_head._ptr &&
-            theHead._counter == aQueue->_head._counter )
+      /*
+       * Consistency check for debugging. Do not remove comments
+       * */
+      //if( theHead._ptr == aQueue->_head._ptr &&
+      //      theHead._counter == aQueue->_head._counter )
       {
          if( theHead._ptr == theTail._ptr )
          {
@@ -135,14 +208,18 @@ static RingElem* ring_get_elem( Ring* aRing, RingList* aQueue )
          }
          else
          {
+            RingData* theData = &theNext._ptr->_prod_data;
+
             theNext._counter = theHead._counter + 1;
 
             *(( unsigned long long int* )&ret) = ( unsigned long long int )__sync_val_compare_and_swap( ( volatile unsigned long long int* )&aQueue->_head,
                                                 *( unsigned long long int* )&theHead, *( unsigned long long int* )&theNext );
 
+
             if( ret._ptr == theHead._ptr &&
                   ret._counter == theHead._counter )
             {
+               ret._ptr->_cons_data = theData;
                break;
             }
          }
@@ -154,36 +231,49 @@ static RingElem* ring_get_elem( Ring* aRing, RingList* aQueue )
    return ret._ptr;
 }
 
-static void ring_put_elem( Ring* aRing, RingElem* anElem, RingList* aQueue )
+/*
+ * Enqueues page to FIFO
+ * */
+static __inline void ring_put_page( Ring* aRing, RingPage* aPage, RingList* aQueue )
 {
+   /*
+    * Soft memory bariers for DCAS
+    * */
    __asm__ __volatile__ ( "" : : : "memory" );
    __sync_synchronize();
 
-   RingPtr theTail;
-   RingPtr theNext;
+   /*
+    * Usually compiler aligned. Prevention.
+    * */
+   __attribute__(( aligned( 8 ) )) RingPtr theTail;
+   __attribute__(( aligned( 8 ) )) RingPtr theNext;
+   __attribute__(( aligned( 8 ) )) RingPtr ret;
 
-   RingPtr ret;
+   aPage->_next._ptr = 0;
+   aPage->_next._counter = 0;
 
-   anElem->_next._ptr = 0;
+   __attribute__(( aligned( 8 ) )) RingPtr thePage;
 
-   RingPtr theElem;
-   theElem._ptr = anElem;
-   theElem._counter = 0;
+   thePage._ptr = aPage;
+   thePage._counter = 0;
 
    while( 1 )
    {
       theTail = aQueue->_tail;
       theNext = theTail._ptr->_next;
 
-      if( theTail._ptr == aQueue->_tail._ptr &&
-            theTail._counter == aQueue->_tail._counter )
+      /*
+       * Consistency check for debugging. Do not remove comments
+       * */
+      //if( theTail._ptr == aQueue->_tail._ptr &&
+      //      theTail._counter == aQueue->_tail._counter )
       {
          if( !theNext._ptr )
          {
-            theElem._counter = theNext._counter + 1;
+            thePage._counter = theNext._counter + 1;
 
             *(( unsigned long long int* )&ret) = ( unsigned long long int )__sync_val_compare_and_swap( ( volatile unsigned long long int* )&theTail._ptr->_next,
-                                                *( unsigned long long int* )&theNext, *( unsigned long long int* )&theElem );
+                                                *( unsigned long long int* )&theNext, *( unsigned long long int* )&thePage );
 
             if( ret._ptr == theNext._ptr &&
                   ret._counter == theNext._counter )
@@ -203,110 +293,224 @@ static void ring_put_elem( Ring* aRing, RingElem* anElem, RingList* aQueue )
       ++g_PutLoopCount;
    }
 
-   theElem._counter = theTail._counter + 1;
+   thePage._counter = theTail._counter + 1;
 
    *(( unsigned long long int* )&ret) = ( unsigned long long int )__sync_val_compare_and_swap( ( volatile unsigned long long int* )&aQueue->_tail,
-                                       *( unsigned long long int* )&theTail, *( unsigned long long int* )&theElem );
+                                       *( unsigned long long int* )&theTail, *( unsigned long long int* )&thePage );
 }
 
-static RingElem* ring_get_write_elem( Ring* aRing )
+static __inline RingPage* ring_get_write_page( Ring* aRing )
 {
-   return ring_get_elem( aRing, &aRing->_writer );
+   RingPage* ret = ring_get_page( aRing, &aRing->_writer );
+
+   if( ret )
+   {
+      __sync_fetch_and_sub( &aRing->_prod_q_size, 1 );
+   }
+
+   return ret;
 }
 
-static RingElem* ring_get_read_elem( Ring* aRing )
+static __inline RingPage* ring_get_read_page( Ring* aRing )
 {
-   return ring_get_elem( aRing, &aRing->_reader );
+   RingPage* ret = ring_get_page( aRing, &aRing->_reader );
+
+   if( ret )
+   {
+      __sync_fetch_and_sub( &aRing->_cons_q_size, 1 );
+   }
+
+   return ret;
 }
 
-static void ring_put_write_elem( Ring* aRing, RingElem* anElem )
+static __inline void ring_put_write_page( Ring* aRing, RingPage* anElem )
 {
-   ring_put_elem( aRing, anElem, &aRing->_reader );
+   ring_put_page( aRing, anElem, &aRing->_reader );
+
+   __sync_fetch_and_add( &aRing->_cons_q_size, 1 );
 }
 
-static void ring_put_read_elem( Ring* aRing, RingElem* anElem )
+static __inline void ring_put_read_page( Ring* aRing, RingPage* anElem )
 {
-   ring_put_elem( aRing, anElem, &aRing->_writer );
+   ring_put_page( aRing, anElem, &aRing->_writer );
+
+   /*
+    * Signal producer no later than half of a ring was processed.
+    * It is possible to do it erlier but in case of fast producer
+    * the core will be flooded with syscalls
+    * */
+   if( __sync_add_and_fetch( &aRing->_prod_q_size, 1 ) > ( RING_PAGE_COUNT / 2 ) )
+   {
+      pthread_mutex_lock( &aRing->_prod_mutex );
+
+      if( aRing->_prod_wanted > 0 )
+      {
+         pthread_cond_signal( &aRing->_prod_cond );
+
+         --aRing->_prod_wanted;
+
+         ++g_SigPrCount;
+      }
+      else if( !aRing->_prod_wanted )
+      {
+         aRing->_prod_wanted = -1;
+      }
+
+      pthread_mutex_unlock( &aRing->_prod_mutex );
+   }
 }
 
-static RingElem* g_rx_elem = 0;
+/*
+ * Cache routines
+ * */
+static __inline RingPage* ring_try_get_cache( Ring* aRing )
+{
+   RingPage* ret = 0;
 
+   __attribute__(( aligned( 4 ) )) RingPage* theCache = aRing->_cache;
+
+   ret = __sync_val_compare_and_swap( &aRing->_cache, theCache, 0 );
+
+   if( theCache != ret )
+   {
+      ret = 0;
+   }
+   else if( ret )
+   {
+      ret->_cons_data = &ret->_prod_data;
+   }
+
+   return ret;
+}
+
+static __inline uint8_t ring_try_put_cache( Ring* aRing, RingPage* aPage )
+{
+   RingPage* theCache = __sync_val_compare_and_swap( &aRing->_cache, 0, aPage );
+
+   return !theCache;
+}
+
+/*
+ * Signaling routines
+ * */
+static __inline void ring_wait_consumer_signal( Ring* aRing )
+{
+   pthread_mutex_lock( &aRing->_prod_mutex );
+
+   ++aRing->_prod_wanted;
+
+   if( aRing->_prod_wanted > 0 )
+   {
+      pthread_cond_wait( &aRing->_prod_cond, &aRing->_prod_mutex );
+   }
+
+   pthread_mutex_unlock( &aRing->_prod_mutex );
+
+}
+
+static __inline void ring_wait_producer_signal( Ring* aRing )
+{
+   pthread_mutex_lock( &aRing->_cons_mutex );
+
+   ++aRing->_cons_wanted;
+
+   if( aRing->_cons_wanted > 0 )
+   {
+      pthread_cond_wait( &aRing->_cons_cond, &aRing->_cons_mutex );
+   }
+
+   pthread_mutex_unlock( &aRing->_cons_mutex );
+}
+
+static __inline void ring_signal_consumer( Ring* aRing )
+{
+   int consSig = aRing->_cons_q_size;
+
+   if( __sync_val_compare_and_swap( &aRing->_cons_q_size, consSig, consSig ) <= 1 )
+   {
+      pthread_mutex_lock( &aRing->_cons_mutex );
+
+      if( aRing->_cons_wanted > 0 )
+      {
+         pthread_cond_signal( &aRing->_cons_cond );
+
+         --aRing->_cons_wanted;
+
+         ++g_SigCsCount;
+      }
+      else if( !aRing->_cons_wanted )
+      {
+         aRing->_cons_wanted = -1;
+      }
+
+      pthread_mutex_unlock( &aRing->_cons_mutex );
+   }
+}
+
+/*
+ * Producer/Consumer routines
+ * */
 static void* ring_rx_thread( void* anArg )
 {
    int theSock = ( int )anArg;
 
-   RingElem* I_elem = 0;
+   RingPage* I_page = 0;
 
    do
    {
-      while( 1 )
+      do
       {
-         I_elem = __sync_val_compare_and_swap( &g_rx_elem, g_rx_elem, 0 );
+         I_page = ring_try_get_cache( &g_RingRx );
 
-         if( !I_elem )
+         if( !I_page )
          {
-            I_elem = ring_get_write_elem( &g_RingRx );
+            I_page = ring_get_write_page( &g_RingRx );
          }
 
-         if( !I_elem )
+         if( !I_page )
          {
             ++g_RxGetFailCount;
 
-            pthread_mutex_lock( &g_RingRx._mutex );
-
-            g_RingRx._wanted = 1;
-
-            pthread_cond_wait( &g_RingRx._cond, &g_RingRx._mutex );
-            pthread_mutex_unlock( &g_RingRx._mutex );
+            ring_wait_consumer_signal( &g_RingRx );
 
             continue;
          }
-
-         break;
       }
+      while( !I_page );
 
       int theLen = 0;
-      if( ( theLen = recv( theSock, I_elem->_payload[ I_elem->_count ], sizeof( I_elem->_payload[ I_elem->_count ] ), 0 ) ) > 0 )
-      {
-         I_elem->_len[ I_elem->_count++ ] = theLen;
-      }
-      else
-      {
-         I_elem->_len[ I_elem->_count ] = 0;
-      }
+      int theMode = 0;
 
-      if( I_elem->_count == sizeof( I_elem->_len ) / sizeof( *I_elem->_len ) || g_RingRx._wanted )
+      do
       {
-         ring_put_write_elem( &g_RingRx, I_elem );
-      }
-      else
-      {
-         RingElem* ret = __sync_val_compare_and_swap( &g_rx_elem, 0, I_elem );
+         theMode = ( I_page->_prod_data._count ? MSG_DONTWAIT : 0 );
 
-         if( ret )
+         if( ( theLen = recv( theSock, I_page->_prod_data._elem[ I_page->_prod_data._count ]._payload, RING_PAYLOAD_SIZE, theMode ) ) > 0 )
          {
-            ring_put_write_elem( &g_RingRx, I_elem );
+            I_page->_prod_data._elem[ I_page->_prod_data._count ]._len = theLen;
          }
+         else
+         {
+            I_page->_prod_data._elem[ I_page->_prod_data._count ]._len = 0;
+         }
+
+         ++I_page->_prod_data._count;
       }
+      while( theLen > 0 && ( I_page->_prod_data._count < RING_ELEM_COUNT ) );
+
+      if( ( I_page->_prod_data._count == RING_ELEM_COUNT ) || !ring_try_put_cache( &g_RingRx, I_page ) )
+      {
+         ring_put_write_page( &g_RingRx, I_page );
+      }
+
+      ring_signal_consumer( &g_RingRx );
 
       ++g_RxCount;
-
-      if( g_RingRx._wanted )
-      {
-         pthread_mutex_lock( &g_RingRx._mutex );
-
-         g_RingRx._wanted = 0;
-
-         pthread_cond_broadcast( &g_RingRx._cond );
-         pthread_mutex_unlock( &g_RingRx._mutex );
-      }
    }
-   while( I_elem );
+   while( I_page );
 
    return 0;
 }
-
-static RingElem* g_tx_elem = 0;
 
 void ring_tx( uint8_t* aData, uint16_t aSize )
 {
@@ -315,148 +519,89 @@ void ring_tx( uint8_t* aData, uint16_t aSize )
       return;
    }
 
-   RingElem* theElem = 0;
+   RingPage* I_page = 0;
 
-   while( 1 )
+   do
    {
-      theElem = __sync_val_compare_and_swap( &g_tx_elem, g_tx_elem, 0 );
+      I_page = ring_try_get_cache( &g_RingTx );
 
-      if( !theElem )
+      if( !I_page )
       {
-         theElem = ring_get_write_elem( &g_RingTx );
+         I_page = ring_get_write_page( &g_RingTx );
       }
 
-      if( !theElem )
+      if( !I_page )
       {
          ++g_PutGetFailCount;
 
-         pthread_mutex_lock( &g_RingTx._mutex );
-
-         g_RingTx._wanted = 1;
-
-         pthread_cond_wait( &g_RingTx._cond, &g_RingTx._mutex );
-         pthread_mutex_unlock( &g_RingTx._mutex );
+         ring_wait_consumer_signal( &g_RingTx );
 
          continue;
       }
-
-      break;
    }
+   while( !I_page );
 
-   memcpy( theElem->_payload[ theElem->_count ], aData, aSize );
+   memcpy( I_page->_prod_data._elem[ I_page->_prod_data._count ]._payload, aData, aSize );
 
-   theElem->_len[ theElem->_count ] = aSize;
+   I_page->_prod_data._elem[ I_page->_prod_data._count ]._len = aSize;
 
-   ++theElem->_count;
+   ++I_page->_prod_data._count;
 
-   if( theElem->_count == sizeof( theElem->_len ) / sizeof( *theElem->_len ) || g_RingTx._wanted )
+   if( I_page->_prod_data._count == RING_ELEM_COUNT || !ring_try_put_cache( &g_RingTx, I_page ) )
    {
-      ring_put_write_elem( &g_RingTx, theElem );
-   }
-   else
-   {
-      RingElem* ret = __sync_val_compare_and_swap( &g_tx_elem, 0, theElem );
-
-      if( ret )
-      {
-         ring_put_write_elem( &g_RingTx, theElem );
-      }
+      ring_put_write_page( &g_RingTx, I_page );
    }
 
-
-   if( g_RingTx._wanted )
-   {
-      pthread_mutex_lock( &g_RingTx._mutex );
-
-      g_RingTx._wanted = 0;
-
-      pthread_cond_broadcast( &g_RingTx._cond );
-      pthread_mutex_unlock( &g_RingTx._mutex );
-   }
+   ring_signal_consumer( &g_RingTx );
 
    ++g_PutCount;
-
-   if( 1 )
-   {
-      ring_debug_print();
-   }
 }
 
 static void* ring_proc_thread( void* anArg )
 {
    ProcessingHandler theHandler = ( ProcessingHandler )anArg;
 
-   RingElem* I_elem = 0;
-
-   int I_signal_guard = 0;
+   RingPage* I_page = 0;
 
    do
    {
-      while( 1 )
+      do
       {
-         I_elem = ring_get_read_elem( &g_RingRx );
+         I_page = ring_get_read_page( &g_RingRx );
 
-         if( !I_elem )
+         if( !I_page )
          {
-            I_elem = __sync_val_compare_and_swap( &g_rx_elem, g_rx_elem, 0 );
+            I_page = ring_try_get_cache( &g_RingRx );
          }
 
-         if( !I_elem )
+         if( !I_page )
          {
             ++g_ProcGetFailCount;
 
-            pthread_mutex_lock( &g_RingRx._mutex );
-
-            if( g_RingRx._wanted )
-            {
-               pthread_cond_broadcast( &g_RingRx._cond );
-            }
-            else
-            {
-               g_RingRx._wanted = 1;
-            }
-
-            I_signal_guard = 0;
-
-            pthread_cond_wait( &g_RingRx._cond, &g_RingRx._mutex );
-            pthread_mutex_unlock( &g_RingRx._mutex );
+            ring_wait_producer_signal( &g_RingRx );
 
             continue;
          }
-
-         break;
       }
+      while( !I_page );
 
       if( theHandler )
       {
          int i;
-         for( i = 0; i < I_elem->_count; ++i )
+         for( i = 0; i < I_page->_cons_data->_count; ++i )
          {
-            theHandler( I_elem->_payload[ i ], I_elem->_len[ i ] );
-            I_elem->_len[ i ] = 0;
+            theHandler( I_page->_cons_data->_elem[ i ]._payload, I_page->_cons_data->_elem[ i ]._len );
+            I_page->_cons_data->_elem[ i ]._len = 0;
 
             ++g_ProcCount;
          }
-
-         I_elem->_count = 0;
       }
 
-      ring_put_read_elem( &g_RingRx, I_elem );
+      I_page->_cons_data->_count = 0;
 
-      if( !( ++I_signal_guard & ( RING_ELEMENT_COUNT / 4 - 1 ) ) )
-      {
-         if( g_RingRx._wanted )
-         {
-            pthread_mutex_lock( &g_RingRx._mutex );
-
-            g_RingRx._wanted = 0;
-
-            pthread_cond_broadcast( &g_RingRx._cond );
-            pthread_mutex_unlock( &g_RingRx._mutex );
-         }
-      }
+      ring_put_read_page( &g_RingRx, I_page );
    }
-   while( I_elem );
+   while( I_page );
 
    return 0;
 }
@@ -465,51 +610,34 @@ static void* ring_tx_thread( void* anArg )
 {
    int theSock = ( int )anArg;
 
-   RingElem* I_elem = 0;
-
-   int I_signal_guard = 0;
+   RingPage* I_page = 0;
 
    do
    {
-      while( 1 )
+      do
       {
-         I_elem = ring_get_read_elem( &g_RingTx );
+         I_page = ring_get_read_page( &g_RingTx );
 
-         if( !I_elem )
+         if( !I_page )
          {
-            I_elem = __sync_val_compare_and_swap( &g_tx_elem, g_tx_elem, 0 );
+            I_page = ring_try_get_cache( &g_RingTx );
          }
 
-         if( !I_elem )
+         if( !I_page )
          {
             ++g_TxGetFailCount;
 
-            pthread_mutex_lock( &g_RingTx._mutex );
-
-            if( g_RingTx._wanted )
-            {
-               pthread_cond_broadcast( &g_RingTx._cond );
-            }
-            else
-            {
-               g_RingTx._wanted = 1;
-            }
-
-            I_signal_guard = 0;
-
-            pthread_cond_wait( &g_RingTx._cond, &g_RingTx._mutex );
-            pthread_mutex_unlock( &g_RingTx._mutex );
+            ring_wait_producer_signal( &g_RingTx );
 
             continue;
          }
-
-         break;
       }
+      while( !I_page );
 
       int i;
-      for( i = 0; i < I_elem->_count; ++i )
+      for( i = 0; i < I_page->_cons_data->_count; ++i )
       {
-         if( send( theSock, I_elem->_payload[ i ], I_elem->_len[ i ], 0 ) == I_elem->_len[ i ] )
+         if( send( theSock, I_page->_cons_data->_elem[ i ]._payload, I_page->_cons_data->_elem[ i ]._len, 0 ) == I_page->_cons_data->_elem[ i ]._len )
          {
             ++g_TxCount;
          }
@@ -518,52 +646,39 @@ static void* ring_tx_thread( void* anArg )
             fprintf( stdout, "ring_tx_thread: error %d\n", errno );
          }
 
-         I_elem->_len[ i ] = 0;
+         I_page->_cons_data->_elem[ i ]._len = 0;
       }
 
-      I_elem->_count = 0;
+      I_page->_cons_data->_count = 0;
 
-      ring_put_read_elem( &g_RingTx, I_elem );
-
-      if( !( ++I_signal_guard & ( RING_ELEMENT_COUNT / 4 - 1 ) ) )
-      {
-         if( g_RingTx._wanted )
-         {
-            pthread_mutex_lock( &g_RingTx._mutex );
-
-            g_RingTx._wanted = 0;
-
-            pthread_cond_broadcast( &g_RingTx._cond );
-            pthread_mutex_unlock( &g_RingTx._mutex );
-         }
-      }
+      ring_put_read_page( &g_RingTx, I_page );
    }
-   while( I_elem );
+   while( I_page );
 
    return 0;
 }
 
 static void ring_create( Ring* aRing )
 {
-   pthread_spin_init( &aRing->_writer._lock, 0 );
-   pthread_spin_init( &aRing->_reader._lock, 0 );
-
    pthread_mutex_t theMutex = PTHREAD_MUTEX_INITIALIZER;
    pthread_cond_t theCond = PTHREAD_COND_INITIALIZER;
 
-   aRing->_mutex = theMutex;
-   aRing->_cond = theCond;
+   aRing->_prod_mutex = theMutex;
+   aRing->_prod_cond = theCond;
 
-   aRing->_writer._head._ptr = ( RingElem* )calloc( 1, sizeof( RingElem ) );
+   aRing->_cons_mutex = theMutex;
+   aRing->_cons_cond = theCond;
+
+   aRing->_writer._head._ptr = ( RingPage* )calloc( 1, sizeof( RingPage ) );
    aRing->_writer._head._counter = 0;
    aRing->_writer._head._ptr->_num = 0;
 
    RingPtr thePrev = aRing->_writer._head;
 
    int I_elem;
-   for( I_elem = 1; I_elem < RING_ELEMENT_COUNT + 1; ++I_elem )
+   for( I_elem = 1; I_elem < RING_PAGE_COUNT + 1; ++I_elem )
    {
-      thePrev._ptr->_next._ptr = ( RingElem* )calloc( 1, sizeof( RingElem ) );
+      thePrev._ptr->_next._ptr = ( RingPage* )calloc( 1, sizeof( RingPage ) );
       thePrev._ptr->_next._counter = 0;
       thePrev._ptr->_next._ptr->_num = I_elem;
 
@@ -575,7 +690,7 @@ static void ring_create( Ring* aRing )
 
    ++I_elem;
 
-   aRing->_reader._head._ptr = ( RingElem* )calloc( 1, sizeof( RingElem ) );
+   aRing->_reader._head._ptr = ( RingPage* )calloc( 1, sizeof( RingPage ) );
    aRing->_reader._head._counter = 0;
    aRing->_reader._head._ptr->_num = I_elem;
 
@@ -605,6 +720,9 @@ int ring_init( int aSocket, ProcessingHandler aHandler )
    ring_create( &g_RingRx );
    ring_create( &g_RingTx );
 
+   g_RingTx._prod_q_size = RING_PAGE_COUNT;
+   g_RingRx._prod_q_size = RING_PAGE_COUNT;
+
    pthread_attr_t theRxAttr;
    pthread_attr_t theTxAttr;
 
@@ -626,11 +744,8 @@ int ring_init( int aSocket, ProcessingHandler aHandler )
    theTxShed.sched_priority=20;
    pthread_attr_setschedparam( &theTxAttr, &theTxShed );
 
-   if( 1 )
-   {
    pthread_create( &g_RxThreadId, 0, ring_rx_thread, ( void* )aSocket );
    pthread_create( &g_ProcThreadId, 0, ring_proc_thread, aHandler );
-   }
    pthread_create( &g_TxThreadId, &theTxAttr, ring_tx_thread, ( void* )aSocket );
 
    return ret;
@@ -641,14 +756,16 @@ void ring_uninit()
 
 }
 
-static void ring_debug_print()
+void ring_debug_print()
 {
-   if( !( g_PrintGuard++ % 1000000 ) )
+   if( !( g_PrintGuard++ % 300000 ) )
    {
       printf( "put lc: %d, get lc: %d, pgf: %d, tgf: %d, prgf: %d, rgf: %d\n",
               g_PutLoopCount, g_GetLoopCount, g_PutGetFailCount, g_TxGetFailCount, g_ProcGetFailCount, g_RxGetFailCount );
 
       printf( "tx: %d, rx: %d, put: %d, proc: %d\n", g_TxCount, g_RxCount, g_PutCount, g_ProcCount );
+
+      printf( "ps: %d, cs: %d, s_pr: %d, s_cs: %d\n", g_RingTx._prod_q_size, g_RingTx._cons_q_size, g_SigPrCount, g_SigCsCount );
 
       g_PutLoopCount = 0;
       g_GetLoopCount = 0;
@@ -661,6 +778,9 @@ static void ring_debug_print()
       g_TxCount = 0;
       g_ProcCount = 0;
       g_PutCount = 0;
+
+      g_SigPrCount = 0;
+      g_SigCsCount = 0;
 
    }
 }
