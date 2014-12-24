@@ -392,6 +392,10 @@ static __inline uint8_t ring_try_put_cache( Ring* aRing, RingPage* aPage )
 
 /*
  * Signaling routines
+ *
+ * Mutexes causes context switch which would slow the system down,
+ * however, in this algorithm, such condition is very rare and might
+ * only happen if one of the sides slover than other.
  * */
 static __inline void ring_wait_consumer_signal( Ring* aRing )
 {
@@ -405,7 +409,6 @@ static __inline void ring_wait_consumer_signal( Ring* aRing )
    }
 
    pthread_mutex_unlock( &aRing->_prod_mutex );
-
 }
 
 static __inline void ring_wait_producer_signal( Ring* aRing )
