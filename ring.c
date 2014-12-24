@@ -117,10 +117,10 @@ typedef struct Ring
    __attribute__(( aligned( 8 ) )) RingList _writer;
 
    /*
-    * Cached page. produced uses it to try to fill all elements
+    * Cached page. producer uses it to try to fill all elements
     * without page get/put operation. Consumer may take the cahe
-    * in case if main consumer's queue is empty. Produced puts
-    * the cache if the page is full or "wanted" flag is set by consumer
+    * in case if main consumer's queue is empty. Produced always puts
+    * the cache.
     * */
    __attribute__(( aligned( 4 ) )) RingPage* volatile _cache;
 }
