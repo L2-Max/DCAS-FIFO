@@ -34,8 +34,8 @@
  * These numbers were predefined for fast producer and slow consumer.
  */
 
-#define RING_PAGE_COUNT          ( 1024 * 8 )
-#define RING_ELEM_COUNT          ( 8 )
+#define RING_PAGE_COUNT          ( 1024 )
+#define RING_ELEM_COUNT          ( 32 )
 
 #define RING_PAYLOAD_SIZE        1600
 
@@ -119,8 +119,8 @@ typedef struct Ring
    /*
     * Cached page. producer uses it to try to fill all elements
     * without page get/put operation. Consumer may take the cahe
-    * in case if main consumer's queue is empty. Produced always puts
-    * the cache.
+    * in case if main consumer's queue is empty. Consumer always puts
+    * the cache back to the provider's queue.
     * */
    __attribute__(( aligned( 4 ) )) RingPage* volatile _cache;
 }
@@ -494,13 +494,13 @@ static void* ring_rx_thread( void* anArg )
          if( ( theLen = recv( theSock, I_page->_prod_data._elem[ I_page->_prod_data._count ]._payload, RING_PAYLOAD_SIZE, theMode ) ) > 0 )
          {
             I_page->_prod_data._elem[ I_page->_prod_data._count ]._len = theLen;
+
+            ++I_page->_prod_data._count;
          }
          else
          {
             I_page->_prod_data._elem[ I_page->_prod_data._count ]._len = 0;
          }
-
-         ++I_page->_prod_data._count;
       }
       while( theLen > 0 && ( I_page->_prod_data._count < RING_ELEM_COUNT ) );
 
